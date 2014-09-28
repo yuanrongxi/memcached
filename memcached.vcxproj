@@ -77,6 +77,7 @@
     <ClInclude Include="assoc.h" />
     <ClInclude Include="cache.h" />
     <ClInclude Include="hash.h" />
+    <ClInclude Include="items.h" />
     <ClInclude Include="jenkins_hash.h" />
     <ClInclude Include="memcached.h" />
     <ClInclude Include="murmur3_hash.h" />
@@ -88,6 +89,7 @@
     <ClCompile Include="assoc.c" />
     <ClCompile Include="cache.c" />
     <ClCompile Include="hash.c" />
+    <ClCompile Include="items.c" />
     <ClCompile Include="jenkins_hash.c" />
     <ClCompile Include="murmur3_hash.c" />
     <ClCompile Include="sasl_defs.c" />

@@ -102,7 +102,7 @@ typedef struct _stritem
 	struct _stritem*	h_next;
 	rel_time_t			time;
 	rel_time_t			exptime; 
-	int					nbtyes;
+	int					nbytes;
 	unsigned short		refcount;
 	uint8_t				nsuffix;
 	uint8_t				it_flags;			//dataµÄ±êÊ¶
@@ -115,8 +115,31 @@ typedef struct _stritem
 	}data[];
 }item;
 
+typedef struct 
+{
+	struct _stritem *next;
+	struct _stritem *prev;
+	struct _stritem *h_next;    /* hash chain next */
+	rel_time_t      time;       /* least recent access */
+	rel_time_t      exptime;    /* expire time */
+	int             nbytes;     /* size of data */
+	unsigned short  refcount;
+	uint8_t         nsuffix;    /* length of flags-and-length string */
+	uint8_t         it_flags;   /* ITEM_* above */
+	uint8_t         slabs_clsid;/* which slab class we're in */
+	uint8_t         nkey;       /* key length, w/terminating null and padding */
+	uint32_t        remaining;  /* Max keys to crawl per slab per invocation */
+} crawler;
 
-struct slab_rebalance {
+
+/* current time of day (updated periodically) */
+extern volatile rel_time_t current_time;
+
+/* TODO: Move to slabs.h? */
+extern volatile int slab_rebalance_signal;
+
+struct slab_rebalance 
+{
 	void *slab_start;
 	void *slab_end;
 	void *slab_pos;

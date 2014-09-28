@@ -1,4 +1,5 @@
 #include "memcached.h"
+#include "slabs.h"
 #include <sys/stat.h>
 #include <sys/socket.h>
 #include <sys/signal.h>
@@ -469,10 +470,371 @@ static int slab_rebalance_move()
 	pthread_mutex_lock(&cache_lock);
 	pthread_mutex_lock(&slabs_lock);
 
+	//将对应的slab class中的slab内存空间转移到需要的内存slab class上,这种情况下会造成以缓冲的kv丢失
+	s_cls = &slabclass[slab_rebal.s_clsid];
+	for(x = 0; x < slab_bulk_check; x++){
+		item* it = (item *)slab_rebal.slab_pos;
+		status = MOVE_PASS;
+		if(it->slabs_clsid != 225){
+			void* hold_lock = NULL;
+
+			uint32_t hv = hash(ITEM_key(it), it->nkey);
+			if(hold_lock == item_trylock(hv) == NULL) //item无法lock,表示可能有item忙
+				status = MOVE_LOCKED;
+			else{
+				refcount = refcount_incr(&it->refcount);
+				if(refcount == 1){
+					if(it->it_flags & ITEM_SLABBED){
+						if(s_cls->slots == it)
+							s_cls->slots = it->next;
+						//先移除free list 
+						if(it->next)
+							it->next->prev = it->prev;
+						if(it->prev)
+							it->prev->next = it->next;
+
+						s_cls->sl_curr --;
+						status = MOVE_DONE;
+					}
+					else
+						status = MOVE_BUSY;
+				}
+				else if(refcount == 2){
+					if((it->it_flags & ITEM_LINKED) != 0){ //如果item不忙，可以直接移除KV
+						do_item_unlink_nolock(it, hv);
+						status = MOVE_DONE;
+					}
+					else
+						status = MOVE_BUSY;
+				}
+				else{
+					if(settings.verbose > 2)
+						fprintf(stderr, "Slab reassign hit a busy item: refcount: %d (%d -> %d)\n", it->refcount, slab_rebal.s_clsid, slab_rebal.d_clsid);
+
+					status = MOVE_BUSY;
+				}
+				item_trylock_unlock(hold_lock);
+			}
+		}
+
+		switch(status){
+		case MOVE_DONE:
+			it->refcount = 0;
+			it->it_flags = 0;
+			it->slabs_clsid = 255;
+			break;
+
+		case MOVE_BUSY:
+			refcount_decr(&it->refcount);
+		case MOVE_LOCKED:
+			slab_rebal.busy_items ++;
+			was_busy ++;
+			break;
+
+		case MOVE_PASS:
+			break;
+		}
+
+		if(slab_rebal.slab_pos >= slab_rebal.slab_end){
+			if(slab_rebal.busy_items){ //移除失败,重新重头开始移除
+				slab_rebal.slab_pos = slab_rebal.slab_start;
+				slab_rebal.busy_items = 0;
+			}
+			else
+				slab_rebal.done ++;
+		}
+	}
+
 	pthread_mutex_unlock(&slabs_lock);
 	pthread_mutex_unlock(&cache_lock);
 
 	return was_busy;
 }
+
+static void slab_rebalance_finish()
+{
+	slabclass_t* s_cls;
+	slabclass_t *d_cls;
+
+	pthread_mutex_lock(&cache_lock);
+	pthread_mutex_lock(&slabs_lock);
+
+	s_cls = &slabclass[slab_rebal.s_clsid];
+	d_cls = &slabclass[slab_rebal.d_clsid];
+
+	//移除slab 页
+	s_cls->slab_list[s_cls->killing - 1] = s_cls->slab_list[s_cls->slabs - 1];
+	s_cls->slabs --;
+	s_cls->killing = 0;
+	
+	//将空余出来的内存放到
+	memset(slab_rebal.slab_start, 0, (size_t)settings.item_size_max);
+	d_cls->slab_list[d_cls->slabs ++] = slab_rebal.slab_start;
+
+	//对slab进行item切分
+	split_slab_page_into_freelist(slab_rebal.slab_start, slab_rebal.d_clsid);
+
+	//复位slab内存转移状态信息
+	slab_rebal.done       = 0;
+	slab_rebal.s_clsid    = 0;
+	slab_rebal.d_clsid    = 0;
+	slab_rebal.slab_start = NULL;
+	slab_rebal.slab_end   = NULL;
+	slab_rebal.slab_pos   = NULL;
+
+	pthread_mutex_unlock(&cache_lock);
+	pthread_mutex_unlock(&slabs_lock);
+
+	STATS_LOCK();
+	stats.slab_reassign_running = false;
+	stats.slabs_moved++;
+	STATS_UNLOCK();
+
+	if (settings.verbose > 1)
+		fprintf(stderr, "finished a slab move\n");
+}
+
+//选择被转移的slab class和slab页
+static int slab_automove_decision(int* src, int *dst)
+{
+	static uint64_t evicted_old[POWER_LARGEST];
+	static unsigned int slab_zeroes[POWER_LARGEST];
+	static unsigned int slab_winner = 0;
+	static unsigned int slab_wins   = 0;
+
+	uint64_t evicted_new[POWER_LARGEST];
+	uint64_t evicted_diff = 0;
+	uint64_t evicted_max  = 0;
+	unsigned int highest_slab = 0;
+	unsigned int total_pages[POWER_LARGEST];
+
+	int i;
+	int source = 0;
+	int dest = 0;
+
+	static rel_time_t next_run;
+
+	if(current_time >= next_run)
+		next_run = current_time + 10;
+	else 
+		return 0;
+
+	item_stats_evictions(evicted_new);
+	pthread_mutex_lock(&cache_lock);
+	//获取每个slab class的页数
+	for(i = POWER_SMALLEST; i < power_largest; i ++)
+		total_pages[i] = slabclass[i].slabs;
+
+	pthread_mutex_unlock(&cache_lock);
+	for(i = POWER_SMALLEST; i < power_largest; i ++){
+		//计算与上一次扫描的item差异
+		evicted_diff = evicted_new[i] - evicted_old[i];
+		if(evicted_diff == 0 && total_pages[i] > 2){ //item无变化，且至少有两页
+			slab_zeroes[i]++;
+			if(source == 0 && slab_zeroes[i] >= 3)
+				source = i;
+		}
+		else{ //有变化，说明slab class是活跃的
+			slab_zeroes[i] = 0;
+			if (evicted_diff > evicted_max){
+				evicted_max = evicted_diff;
+				highest_slab = i;
+			}
+		}
+
+		//进行活跃保存
+		evicted_old[i] = evicted_new[i];
+	}
+
+	if(slab_winner != 0 && slab_winner == highest_slab){ //检测变化一直为最大的slab class,就会设置为dest
+		slab_wins ++;
+		if(slab_wins >= 3)
+			dest = slab_winner;
+	}
+	else{
+		slab_wins = 1;
+		slab_winner = highest_slab;
+	}
+
+	//选定转移的源slab和目的slab
+	if(source && dest){
+		*src = source;
+		*dst = dest;
+		return 1;
+	}
+
+	return 0;
+}
+
+
+static void* slab_maintenance_thread(void* arg)
+{
+	int src, dest;
+
+	while(do_run_slab_thread){
+		if(settings.slab_automove){
+			if(slab_automove_decision(&src, &dest) == 1){ //判断是否需要rebalance
+				slabs_reassign(src, dest); //进行rebalance信号通告
+			}
+			sleep(1);
+		}
+		else
+			Sleep(5);
+	}
+
+	return NULL;
+}
+
+static void* slab_rebalance_thread(void* arg)
+{
+	int was_busy = 0;
+	mutex_lock(&slabs_rebalance_lock);
+
+	while(do_run_slab_rebalance_thread){
+		if(slab_rebalance_signal == 1){
+			if(slab_rebalance_start() < 0) //开始rebalance,如果启动失败，放弃本次rebalance
+				slab_rebalance_signal = 0;
+
+			was_busy = 0;
+		}
+		else if(slab_rebalance_signal && slab_rebal.slab_start != NULL)
+			was_busy = slab_rebalance_move();  //进行内存转移
+
+		if(slab_rebal.done) //rebalance
+			slab_rebalance_finish();
+		else if(was_busy)
+			usleep(50);
+
+		//没有rebalance在处理，进行下一次rebanlance的信号等待
+		if(slab_rebalance_signal == 0)
+			 pthread_cond_wait(&slab_rebalance_cond, &slabs_rebalance_lock);
+	}
+
+	return NULL;
+}
+
+//挑选可以进行rebanlance的源，一般从大序号查到小序号，因为item size大的概率比item小的概率小
+static int slabs_ressign_pick_any(int dst)
+{
+	static int cur = POWER_SMALLEST - 1;
+	int tries = power_largest - POWER_SMALLEST + 1;
+	for(; tries > 0; tries --){
+		cur ++;
+		if(cur > power_largest)
+			cur = POWER_SMALLEST;
+
+		if(cur == dst)
+			continue;
+
+		if(slabclass[cur].slabs > 1)
+			return cur;
+	}
+
+	return -1;
+}
+
+static enum reassign_result_type do_slabs_reassign(int src, int dst)
+{
+	//已经在rebalance
+	if (slab_rebalance_signal != 0)
+		return REASSIGN_RUNNING;
+
+	if(src == dst)
+		return REASSIGN_SRC_DST_SAME;
+
+	//转移源没有指定，从slab classes中重新选择一个
+	if(src == -1)
+		src = slabs_ressign_pick_any(dst);
+
+	if(src < POWER_SMALLEST || src > power_largest ||
+		dst < POWER_SMALLEST || dst > power_largest)
+		return REASSIGN_BADCLASS;
+
+	if(slabclass[src].slabs < 2)
+		return REASSIGN_NOSPARE;
+
+	//设置转移的参数
+	slab_rebal.s_clsid = src;
+	slab_rebal.d_clsid = dst;
+
+	//设置rebalance启动的标识
+	slab_rebalance_signal = 1;
+	pthread_cond_signal(&slab_rebalance_cond);
+
+	return REASSIGN_OK;
+}
+
+enum reassign_result_type slabs_reassign(int src, int dst)
+{
+	enum reassign_result_type ret;
+	if(pthread_mutex_trylock(&slabs_rebalance_lock) != 0)
+		return REASSIGN_RUNNING;
+
+	ret = do_slabs_reassign(src, dst);
+	pthread_mutex_unlock(&slabs_rebalance_lock);
+	return ret;
+}
+
+void slabs_rebalancer_pause()
+{
+    pthread_mutex_lock(&slabs_rebalance_lock);
+}
+
+void slabs_rebalancer_resume() 
+{
+	pthread_mutex_unlock(&slabs_rebalance_lock);
+}
+
+static pthread_t maintenance_tid;
+static pthread_t rebalance_tid;
+
+int start_slab_maintenance_thread()
+{
+	int ret;
+	slab_rebalance_signal = 0;
+	slab_rebal.slab_start = NULL;
+
+	//获取一次内存转移的item个数
+	char* env = getenv("MEMCACHED_SLAB_BULK_CHECK");
+	if(env != NULL){
+		slab_bulk_check = atoi(env);
+		if (slab_bulk_check == 0)
+			slab_bulk_check = DEFAULT_SLAB_BULK_CHECK;
+	}
+
+	if(pthread_cond_init(&slab_rebalance_cond, NULL) != 0){
+		fprintf(stderr, "Can't intiialize rebalance condition\n");
+		return -1;
+	}
+
+	pthread_mutex_init(&slabs_rebalance_lock, NULL);
+
+	//启动内存转移判断线程
+	if((ret = pthread_create(&maintenance_tid, NULL, slab_maintenance_thread, NULL)) != 0){
+		fprintf(stderr, "Can't create slab maint thread: %s\n", strerror(ret));
+		return -1;
+	}
+	//启动rebalance线程
+	if ((ret = pthread_create(&rebalance_tid, NULL, slab_rebalance_thread, NULL)) != 0) {
+		fprintf(stderr, "Can't create rebal thread: %s\n", strerror(ret));
+		return -1;
+	}
+}
+
+void stop_slab_maintenance_thread(void) 
+{
+	mutex_lock(&cache_lock);
+
+	do_run_slab_thread = 0;
+	do_run_slab_rebalance_thread = 0;
+
+	pthread_cond_signal(&maintenance_cond);
+	pthread_mutex_unlock(&cache_lock);
+
+	pthread_join(maintenance_tid, NULL);
+	pthread_join(rebalance_tid, NULL);
+}
+
+
 
 
