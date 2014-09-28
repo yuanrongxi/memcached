@@ -308,6 +308,15 @@ int do_item_link(item* it, const uint32_t hv)
 	return 1;
 }
 
+void do_item_unlink_nolock(item* it, const uint32_t hv)
+{
+	MEMCACHED_ITEM_UNLINK(ITEM_key(it), it->nkey, it->nbytes);
+	if((it->it_flags & ITEM_LINKED) != 0){
+
+	}
+}
+
+
 
 
 
