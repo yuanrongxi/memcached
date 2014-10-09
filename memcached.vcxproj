@@ -83,6 +83,7 @@
     <ClInclude Include="murmur3_hash.h" />
     <ClInclude Include="protocol_binary.h" />
     <ClInclude Include="sasl_defs.h" />
+    <ClInclude Include="trace.h" />
     <ClInclude Include="util.h" />
   </ItemGroup>
   <ItemGroup>
@@ -91,6 +92,7 @@
     <ClCompile Include="hash.c" />
     <ClCompile Include="items.c" />
     <ClCompile Include="jenkins_hash.c" />
+    <ClCompile Include="memcached.c" />
     <ClCompile Include="murmur3_hash.c" />
     <ClCompile Include="sasl_defs.c" />
     <ClCompile Include="slabs.c" />

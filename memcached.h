@@ -19,13 +19,39 @@
 
 #include "sasl_defs.h"
 
+#include "stats.h"
+#include "slabs.h"
+#include "assoc.h"
+#include "items.h"
+#include "trace.h"
+#include "hash.h"
+#include "util.h"
+
 /** Maximum length of a key. */
 #define KEY_MAX_LENGTH 250
 
 /** Size of an incr buf. */
 #define INCR_MAX_STORAGE_LEN 24
 
+#define DATA_BUFFER_SIZE 2048
+#define UDP_READ_BUFFER_SIZE 65536
+#define UDP_MAX_PAYLOAD_SIZE 1400
+#define UDP_HEADER_SIZE 8
+#define MAX_SENDBUF_SIZE (256 * 1024 * 1024)
+
 #define SUFFIX_SIZE 24
+#define ITEM_LIST_INITIAL 200
+#define SUFFIX_LIST_INITIAL 20
+#define IOV_LIST_INITIAL 400
+#define MSG_LIST_INITIAL 10
+
+#define READ_BUFFER_HIGHWAT 8192
+#define ITEM_LIST_HIGHWAT 400
+#define IOV_LIST_HIGHWAT 600
+#define MSG_LIST_HIGHWAT 100
+
+#define MIN_BIN_PKT_LENGTH 16
+#define BIN_PKT_HDR_WORDS (MIN_BIN_PKT_LENGTH/sizeof(uint32_t))
 
 //slab sizing ∂®“Â
 #define POWER_SMALLEST 1
@@ -299,7 +325,7 @@ struct settings {
 typedef struct conn conn;
 struct conn
 {
-	int		fid;
+	int		sfd;
 	sasl_conn_t* sasl_conn;
 	bool	authenticated;
 	enum conn_states state;
@@ -347,6 +373,9 @@ struct conn
 	char   **suffixcurr;
 	int    suffixleft;
 
+	enum protocol protocol;
+	enum network_transport transport;
+
 	int    request_id;
 	struct sockaddr_in6 request_addr;
 	socklen_t request_addr_size;
@@ -363,7 +392,7 @@ struct conn
 
 	protocol_binary_request_header binary_header;
 	uint64_t cas;
-
+	short cmd;
 	int opaque;
 	int keylen;
 	conn   *next; 
@@ -376,5 +405,67 @@ extern conn **conns;
 extern struct stats stats;
 extern time_t process_started;
 extern struct settings settings;
+
+/********************************************thread.c function*****************************************/
+void thread_init(int nthreads, struct event_base *main_base);
+int dispatch_event_add(int thread, conn* c);
+void dispatch_conn_new(int sfd, enum conn_states init_state, int event_flags, int read_buffer_size, enum network_transport transport);
+
+enum delta_result_type add_delta(conn *c, const char *key, const size_t nkey, const int incr, const int64_t delta, char *buf, uint64_t *cas);
+void accept_new_conns(const bool do_accept);
+conn* conn_from_freelist();
+bool conn_add_to_freelist(conn *c);
+
+int is_listen_thread();
+
+item* item_alloc(char *key, size_t nkey, int flags, rel_time_t exptime, int nbytes);
+char* item_cachedump(const unsigned int slabs_clsid, const unsigned int limit, unsigned int *bytes);
+void  item_flush_expired();
+item *item_get(const char *key, const size_t nkey);
+item *item_touch(const char *key, const size_t nkey, uint32_t exptime);
+int   item_link(item *it);
+void  item_remove(item *it);
+int   item_replace(item *it, item *new_it, const uint32_t hv);
+void  item_stats(ADD_STAT add_stats, void *c);
+void  item_stats_totals(ADD_STAT add_stats, void *c);
+void  item_stats_sizes(ADD_STAT add_stats, void *c);
+void  item_unlink(item *it);
+void  item_update(item *it);
+
+void item_lock_global(void);
+void item_unlock_global(void);
+void item_lock(uint32_t hv);
+void *item_trylock(uint32_t hv);
+void item_trylock_unlock(void *arg);
+void item_unlock(uint32_t hv);
+void switch_item_lock_type(enum item_lock_types type);
+unsigned short refcount_incr(unsigned short *refcount);
+unsigned short refcount_decr(unsigned short *refcount);
+void STATS_LOCK(void);
+void STATS_UNLOCK(void);
+void threadlocal_stats_reset(void);
+void threadlocal_stats_aggregate(struct thread_stats *stats);
+void slab_stats_aggregate(struct thread_stats *stats, struct slab_stats *out);
+
+/********************************************************************************************************/
+/* Stat processing functions */
+void append_stat(const char *name, ADD_STAT add_stats, conn *c,
+	const char *fmt, ...);
+
+enum store_item_type store_item(item *item, int comm, conn *c);
+
+#if HAVE_DROP_PRIVILEGES
+extern void drop_privileges(void);
+#else
+#define drop_privileges()
+#endif
+
+
+#if !defined(__GNUC__) || (__GNUC__ == 2 && __GNUC_MINOR__ < 96)
+#define __builtin_expect(x, expected_value) (x)
+#endif
+
+#define likely(x)       __builtin_expect((x),1)
+#define unlikely(x)     __builtin_expect((x),0)
 
 #endif
