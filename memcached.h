@@ -19,6 +19,14 @@
 
 #include "sasl_defs.h"
 
+/** Maximum length of a key. */
+#define KEY_MAX_LENGTH 250
+
+/** Size of an incr buf. */
+#define INCR_MAX_STORAGE_LEN 24
+
+#define SUFFIX_SIZE 24
+
 //slab sizing ¶¨Òå
 #define POWER_SMALLEST 1
 #define POWER_LARGEST  200
@@ -26,6 +34,10 @@
 #define MAX_NUMBER_OF_SLAB_CLASSES (POWER_LARGEST + 1)
 
 #define TAIL_REPAIR_TIME_DEFAULT 0
+
+#define HASHPOWER_DEFAULT 16
+
+#define ITEM_UPDATE_INTERVAL 60
 
 #define ITEM_get_cas(i) (((i)->it_flags & ITEM_CAS) ? (i)->data->cas : 0)
 
@@ -80,9 +92,53 @@ enum conn_states
 	conn_max_state   /**< Max state value (used for assertion) */
 };
 
+enum bin_substates {
+	bin_no_state,
+	bin_reading_set_header,
+	bin_reading_cas_header,
+	bin_read_set_value,
+	bin_reading_get_key,
+	bin_reading_stat,
+	bin_reading_del_header,
+	bin_reading_incr_header,
+	bin_read_flush_exptime,
+	bin_reading_sasl_auth,
+	bin_reading_sasl_auth_data,
+	bin_reading_touch_key,
+};
+
+enum protocol {
+	ascii_prot = 3, /* arbitrary value. */
+	binary_prot,
+	negotiating_prot /* Discovering the protocol */
+};
+
+enum network_transport {
+	local_transport, /* Unix sockets*/
+	tcp_transport,
+	udp_transport
+};
+
 enum item_lock_types {
 	ITEM_LOCK_GRANULAR = 0,
 	ITEM_LOCK_GLOBAL
+};
+
+#define IS_UDP(x) (x == udp_transport)
+
+#define NREAD_ADD 1
+#define NREAD_SET 2
+#define NREAD_REPLACE 3
+#define NREAD_APPEND 4
+#define NREAD_PREPEND 5
+#define NREAD_CAS 6
+
+enum store_item_type {
+	NOT_STORED=0, STORED, EXISTS, NOT_FOUND
+};
+
+enum delta_result_type {
+	OK, NON_NUMERIC, EOM, DELTA_ITEM_NOT_FOUND, DELTA_ITEM_CAS_MISMATCH
 };
 
 typedef unsigned int rel_time_t;
@@ -131,6 +187,24 @@ typedef struct
 	uint32_t        remaining;  /* Max keys to crawl per slab per invocation */
 } crawler;
 
+typedef struct
+{
+	pthread_t			thread_id;
+	struct event_base*	base;
+	struct event		notify_event;
+	int					notify_receive_fd;
+	int					notify_send_fd;
+	struct thread_stats stats;
+	struct conn_queue*  new_conn_queue;
+	cache_t*			suffix_cache;
+	uint8_t				item_lock_type;
+}LIBEVENT_THREAD;
+
+typedef struct 
+{
+	pthread_t thread_id;        /* unique ID of this thread */
+	struct event_base *base;    /* libevent handle this thread uses */
+} LIBEVENT_DISPATCHER_THREAD;
 
 /* current time of day (updated periodically) */
 extern volatile rel_time_t current_time;
@@ -150,5 +224,157 @@ struct slab_rebalance
 };
 
 extern struct slab_rebalance slab_rebal;
+
+struct stats {
+	pthread_mutex_t mutex;
+	unsigned int  curr_items;
+	unsigned int  total_items;
+	uint64_t      curr_bytes;
+	unsigned int  curr_conns;
+	unsigned int  total_conns;
+	uint64_t      rejected_conns;
+	uint64_t      malloc_fails;
+	unsigned int  reserved_fds;
+	unsigned int  conn_structs;
+	uint64_t      get_cmds;
+	uint64_t      set_cmds;
+	uint64_t      touch_cmds;
+	uint64_t      get_hits;
+	uint64_t      get_misses;
+	uint64_t      touch_hits;
+	uint64_t      touch_misses;
+	uint64_t      evictions;
+	uint64_t      reclaimed;
+	time_t        started;          /* when the process was started */
+	bool          accepting_conns;  /* whether we are currently accepting */
+	uint64_t      listen_disabled_num;
+	unsigned int  hash_power_level; /* Better hope it's not over 9000 */
+	uint64_t      hash_bytes;       /* size used for hash tables */
+	bool          hash_is_expanding; /* If the hash table is being expanded */
+	uint64_t      expired_unfetched; /* items reclaimed but never touched */
+	uint64_t      evicted_unfetched; /* items evicted but never touched */
+	bool          slab_reassign_running; /* slab reassign in progress */
+	uint64_t      slabs_moved;       /* times slabs were moved around */
+	bool          lru_crawler_running; /* crawl in progress */
+};
+
+#define MAX_VERBOSITY_LEVEL 2
+
+struct settings {
+    size_t maxbytes;
+    int maxconns;
+    int port;
+    int udpport;
+    char *inter;
+    int verbose;
+    rel_time_t oldest_live;		/* ignore existing items older than this */
+    int evict_to_free;
+    char *socketpath;			/* path to unix socket if using local socket */
+    int access;					/* access mask (a la chmod) for unix domain socket */
+    double factor;				/* chunk size growth factor */
+    int chunk_size;
+    int num_threads;			/* number of worker (without dispatcher) libevent threads to run */
+    int num_threads_per_udp;	/* number of worker threads serving each udp socket */
+    char prefix_delimiter;		/* character that marks a key prefix (for stats) */
+    int detail_enabled;			/* nonzero if we're collecting detailed stats */
+    int reqs_per_event;			/* Maximum number of io to process on each io-event. */
+    bool use_cas;
+    enum protocol binding_protocol;
+    int backlog;
+    int item_size_max;			/* Maximum item size, and upper end for slabs */
+    bool sasl;					/* SASL on/off */
+    bool maxconns_fast;			/* Whether or not to early close connections */
+    bool lru_crawler;			/* Whether or not to enable the autocrawler thread */
+    bool slab_reassign;			/* Whether or not slab reassignment is allowed */
+    int slab_automove;			/* Whether or not to automatically move slabs */
+    int hashpower_init;			/* Starting hash power level */
+    bool shutdown_command;		/* allow shutdown command */
+    int tail_repair_time;		/* LRU tail refcount leak repair time */
+    bool flush_enabled;			/* flush_all enabled */
+    char *hash_algorithm;		/* Hash algorithm in use */
+    int lru_crawler_sleep;		/* Microsecond sleep between items */
+    uint32_t lru_crawler_tocrawl; /* Number of items to crawl per run */
+};
+
+typedef struct conn conn;
+struct conn
+{
+	int		fid;
+	sasl_conn_t* sasl_conn;
+	bool	authenticated;
+	enum conn_states state;
+	enum bin_substates substate;
+	rel_time_t last_cmd_time;
+	struct event event;
+	short  ev_flags;
+	short  which; 
+
+	char   *rbuf;
+	char   *rcurr;
+	int    rsize;
+	int    rbytes;
+
+	char   *wbuf;
+	char   *wcurr;
+	int    wsize;
+	int    wbytes;
+
+	enum conn_states  write_and_go;
+	void   *write_and_free;
+
+	char   *ritem;
+	int    rlbytes;
+	void   *item;
+	int    sbytes;
+
+	struct iovec *iov;
+	int    iovsize;
+	int    iovused;
+
+	struct msghdr *msglist;
+	int    msgsize;
+	int    msgused;
+	int    msgcurr;
+	int    msgbytes;
+
+	item   **ilist;
+	int    isize;
+	item   **icurr;
+	int    ileft;
+
+	char   **suffixlist;
+	int    suffixsize;
+	char   **suffixcurr;
+	int    suffixleft;
+
+	int    request_id;
+	struct sockaddr_in6 request_addr;
+	socklen_t request_addr_size;
+	unsigned char *hdrbuf;
+	int    hdrsize; 
+
+	bool   noreply;
+
+	struct {
+		char *buffer;
+		size_t size;
+		size_t offset;
+	} stats;
+
+	protocol_binary_request_header binary_header;
+	uint64_t cas;
+
+	int opaque;
+	int keylen;
+	conn   *next; 
+
+	LIBEVENT_THREAD *thread;
+};
+
+extern conn **conns;
+
+extern struct stats stats;
+extern time_t process_started;
+extern struct settings settings;
 
 #endif

@@ -95,6 +95,7 @@
     <ClCompile Include="sasl_defs.c" />
     <ClCompile Include="slabs.c" />
     <ClCompile Include="slabs.h" />
+    <ClCompile Include="thread.c" />
     <ClCompile Include="util.c" />
   </ItemGroup>
   <Import Project="$(VCTargetsPath)\Microsoft.Cpp.targets" />
