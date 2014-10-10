@@ -112,11 +112,11 @@ typedef union{
 		uint16_t keylen;	
 		uint8_t extlen;	
 		uint8_t datatype;	
-		uint16_t reserved;
+		uint16_t status;
 		uint32_t bodylen;
 		uint32_t opaque;
 		uint64_t cas;
-	}request;
+	}response;
 	uint8_t bytes[24];
 }protocol_binary_response_header;
 

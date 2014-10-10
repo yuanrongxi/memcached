@@ -101,7 +101,7 @@ void* cache_alloc(cache_t* handle)
 		uint64_t* pre = (uint64_t *)ret;
 		*pre = redzone_patten;
 		ret = (void *)(pre + 1);
-		memcpy((char*)ret + handle->bufsize - (2 * sizeof(redzone_pattern)), &redzone_patten, sizeof(redzone_pattern));
+		memcpy((char*)ret + handle->bufsize - (2 * sizeof(redzone_patten)), &redzone_patten, sizeof(redzone_patten));
 	}
 #endif
 

@@ -406,6 +406,18 @@ extern struct stats stats;
 extern time_t process_started;
 extern struct settings settings;
 
+void do_accept_new_conns(const bool do_accept);
+enum delta_result_type do_add_delta(conn *c, const char *key, const size_t nkey, const bool incr, const int64_t delta, char *buf,uint64_t *cas, const uint32_t hv);
+enum store_item_type do_store_item(item *item, int comm, conn* c, const uint32_t hv);
+conn *conn_new(const int sfd, const enum conn_states init_state, const int event_flags, const int read_buffer_size, enum network_transport transport, struct event_base *base);
+extern int daemonize(int nochdir, int noclose);
+
+static inline int mutex_lock(pthread_mutex_t *mutex)
+{
+	while (pthread_mutex_trylock(mutex));
+	return 0;
+}
+
 /********************************************thread.c function*****************************************/
 void thread_init(int nthreads, struct event_base *main_base);
 int dispatch_event_add(int thread, conn* c);
